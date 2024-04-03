@@ -77,7 +77,7 @@ StructInfo ::= TensorStructInfo(shape: Expr?, dtype: DataType, vdevice: VDevice?
              | PrimStructInfo(dtype: DataType, value: PrimExpr?)
              | ObjectStructInfo()
              | TupleStructInfo(fields: [StructInfo])
-             | FuncStructInfo(params: [StructInfo]?, ret: StructInfo, purity: bool, derive_func: EnvFunc?*)
+             | FuncStructInfo(params: [StructInfo]?, ret: StructInfo, purity: bool?, derive_func: EnvFunc?)
 
 # expressions
 Expr ::=   Constant(data: NDArray)
@@ -199,7 +199,7 @@ Analogously to a type system in most languages, Relax tracks structural informat
 2. `TupleStructInfo` corresponds to tuple values, giving the `StructInfo` for each member of the tuple.
 3. `PrimStructInfo` corresponds to `PrimValue`s (immutable scalar values), giving their TIR datatype.
 4. `ShapeStructInfo` corresponds to shape values, optionally giving the number of dimensions in the shape and an expression that computes the shape's dimensions (either a `ShapeExpr` or a `Var`).
-5. `FunctionStructInfo` corresponds to function values (closures) and `PackedFunc`s (external functions), giving the types of the parameters, the return type, and whether the function is pure.
+5. `FunctionStructInfo` corresponds to function values (closures) and `PackedFunc`s (external functions), giving the types of the parameters, the return type, and the function's purity (pure, impure, or unknown).
 6. `ObjectStructInfo` is a parent to all Relax `StructInfo` and corresponds to all the values above as well as any values returned by `PackedFunc` calls that do not fit in the above categories.
 
 `StructInfo` is assigned to every variable in scope and every type of expression based on the values it returns via a set of inference rules defined later in the specification, making use of subtyping to assign more general `StructInfo` when a more specific one cannot be determined. «Relax is strongly typed, meaning that if the `StructInfo` inferred is less specific than the one expected, an error will be issued and an explicit check via `MatchCast` will be required.»
@@ -328,6 +328,7 @@ The following criteria apply to all programs (including before normalization):
 22. For `PrimStructInfo`, if the `value` field is defined, the TIR `dtype` for the `PrimExpr` must match the `PrimStructInfo`'s `dtype` field (i.e., the datatypes must be consistent).
 23. For any `Call` node where the callee (`op` field) is an `Op` node, if the `Op` has a custom normalization rule, the call must conform to that rule. In particular, applying to the normalization rule to the `Call` should not require any further changes.
 24. «All `VDevice`s reference in `StructInfo` annotations _must_ appear in the `IRModule`'s `global_info` map. (Corollary: If no `VDevice` is given in `global_info`, then _all_ `vdevice` fields in `TensorStructInfo` annotations must remain undefined.)»
+25. Any `FuncStructInfo` annotation in a function signature (either a parameter annotation or a return type) must have a _defined_ `purity` field. That is, higher-order functions must define what purity they expect from closures that they take or closures they return. This rule exists in order to ensure that it will be possible to infer a definite purity at compile time for any function called in a dataflow block.
 
 Additionally, the criteria for normal form listed in [the previous section](#normal-form) must apply to any program that has been normalized.
 
@@ -458,7 +459,9 @@ Note that judging subtyping requires potentially reasoning about arbitrary `Shap
 8. For `FuncStructInfo`:
     1. Given an arbitrary derivation function `derive_func`, `FuncStructInfo(ret=ObjectStructInfo(), derive_func=derive_func) <: FuncStructInfo(ret=ObjectStructInfo(), derive_func=empty_derive)`.
     2. Corollary, following from reflexivity: For two `FuncStructInfo` `F1` and `F2` with undefined `params`, `F1 <: F2` only if `F1.derive_func` and `F2.derive_func` are identical.
-    3. Given a list of `StructInfo` parameters `P` and a `StructInfo` return annotation `R`, then `FuncStructInfo(params=P, ret=R, purity=True) <: FuncStructInfo(params=P, ret=R, purity=False)`. That is, a pure function can be passed where an impure one is accepted, but not vice versa.
+    3. Given a list of `StructInfo` parameters `P` and a `StructInfo` return annotation `R`, then:
+        1. `FuncStructInfo(params=P, ret=R, purity=True) <: FuncStructInfo(params=P, ret=R, purity=False)`. That is, a pure function can be passed where an impure one is accepted, but not vice versa.
+        2. `FuncStructInfo(params=P, ret=R, purity=undefined) <: FuncStructInfo(params=P, ret=R, purity=True)`. That is, a function of unknown purity can be passed where a pure one is accepted.
     3. Given two lists of `StructInfo` parameters `P1` and `P2`, two `StructInfo` annotations `R1` and `R2`, and a Boolean `purity`, `FuncStructInfo(params=P1, ret=R1, purity=purity) <: FuncStructInfo(params=P2, ret=R2, purity=purity)` if `P1` and `P2` are the same length and for all `i`, `P2[i] <: P1[i]` and `R1 <: R2`. We consider the subtyping relationship to _possibly_ hold if any of the subtyping relationships given only possibly holds.
 
 These rules allow us to define the least upper bound (LUB) for any two `StructInfo` `S1` and `S2`, meaning that it is the most specific `StructInfo` `S` for which `S1 <: S` and `S2 <: S` ("most specific" meaning that if there exists some other `S'` for which `S1 <: S'` and `S2 <: S'`, then `S <: S'`), modulo reasoning about arithmetic (for example, the compiler may judge that two shape expressions are _possibly_ equivalent rather than _definitely_ equivalent). The LUB is guaranteed to exist for any two `StructInfo` because all `StructInfo` are subtypes of `ObjectStructInfo`.
@@ -530,8 +533,16 @@ def unify_struct_info(S1: StructInfo, S2: StructInfo) -> StructInfo:
         if S1.params and S2.params are both defined:
             if S1.params and S2.params do not have the same length:
                 return ObjectStructInfo()
-            # the LUB is pure if they're both pure and false if either isn't
-            purity = S1.purity and S2.purity
+            # Purity is a bit of a special case. We permit functions of undefined purity
+            # to be passed where either pure or impure functions are accepted, but we
+            # also require the purity to be inferred later
+            purity = undefined
+            if S1.purity is defined and False or S2.purity is defined and False:
+                # it would also be valid to have it be undefined in this case,
+                # but we set it to False to disambiguate
+                purity = False
+            if S1 and S2 both have defined purity and are both pure:
+                purity = True
             unified_params = []
             for 0 <= i < length of S1.params:
                 unified_param = unify_struct_info(S1.params[i], S2.params[i])
@@ -556,11 +567,11 @@ For each kind of expression, we can recursively build up the structural informat
 The below derivation rules will explain in formal detail how Relax checks the correctness of purity annotations and enforces that impure calls are not made inside `DataflowBlock`s. At a high level, it operates by the following principles:
 1. Calls to `ExternFunc`s (which thus includes any expression whose `StructInfo` is `FuncStructInfo` with a `derive_func` included) are assumed to be impure by default. The `call_pure_packed` operator can be used to indicate to the compiler that a particular call to an `ExternFunc` is, in fact, pure.
 2. `Op` nodes must have an attribute called `FPurity`, which is a boolean flag that indicates whether or not the operator is pure. If the operator can have visible side effects in any case at all, it should be considered impure.
-3. For Relax `Function`s, the purity will depend on the `is_pure` annotation (which must be user-supplied).
+3. For Relax `Function`s, the purity can be annotated explicitly (and later checked) using the `is_pure` attribute or inferred from the body (whether there is a call to an impure function, for example) if the `is_pure` annotation is omitted. In some cases, if the purity is not annotated it may also not be possible to infer it, in which case the purity will be treated as unknown.
 
-Thus, the `StructInfo` system can determine whether a call is pure based on the above principles: For operators, it refers to `FPurity` and otherwise it refers to the `FuncStructInfo` (using the `purity` field for functions with `params` defined and assuming that any function with a `derive_func` defined is impure). If any such call occurs inside a `DataflowBlock` or a `Function` whose `is_pure` field is set to `True`, that is treated as a type error.
+Thus, the `StructInfo` system can determine whether a call is pure based on the above principles: For operators, it refers to `FPurity` and otherwise it refers to the `FuncStructInfo` (using the `purity` field for functions with `params` defined and assuming that any function with a `derive_func` defined is impure). If any such call occurs inside a `DataflowBlock` or a `Function` whose `is_pure` field is set to `True`, that is treated as a type error. Note that if the `purity` field of the `FuncStructInfo` of a called closure is undefined, this indicates that the purity of the closure is _unknown_; this is not a type-checking error but rather indicates that the purity inference pass must be performed (see [below](#inferring-function-purity-globally)).
 
-For verifying the purity of a function, however, there is one workaround permitted: If the function has the `relax.force_pure` attribute mapped to `True` in its `attrs`, then impure calls will be disregarded. This accounts for situations where individual actions may be impure (like mutating a value) but the overall effect of the function is pure (e.g., if the value that is mutated is one that is created inside the function, meaning that no externally-visible memory was ever mutated). This case is unlikely to be common for input programs, though `relax.force_pure` is used frequently in later stages of compilation.
+For verifying the purity of a function, there is a manual override to inform the type system that a function should be treated as pure even if there are impure calls in it: If the function has the `relax.force_pure` attribute mapped to `True` in its `attrs`, then impure calls will be disregarded. This accounts for situations where individual actions may be impure (like mutating a value) but the overall effect of the function is pure (e.g., if the value that is mutated is one that is created inside the function, meaning that no externally-visible memory was ever mutated). This case is unlikely to be common for input programs, though `relax.force_pure` is used frequently in later stages of compilation.
 
 ### Auxiliary Procedures
 
@@ -731,15 +742,25 @@ We can check if some structural information `S1` is accepted where structural in
     2. If both `S1` and `S2` have undefined `params`, consider them compatible if they have an identical `derive_func` and consider them possibly compatible if they have different `derive_func`s (as they is no further way to introspect the `derive_func` and draw static conslusions about `PackedFunc`s).
     3. If `params` is defined for both `S1` and `S2`:
         1. Consider them incompatible if the `params` have different lengths. 
-        2. If the `purity` of `S1` is `False` but the `purity` of `S2` is `True`, then consider them incompatible.
+        2. If the `purity` of `S1` is `False` but the `purity` of `S2` is `True`, then consider them incompatible. If the purity of `S1` is undefined and the purity of `S2` is `True`, then consider them possibly compatible.
         3. Next, map unbound shape variables as follows: Get a variable mapping `m` by applying `get_shape_var_mapping(S1.params[i], S2.params[i])` for all values of `i`, taking the union of all resulting mappings. Next, substitute all occurrences of the shape variables in `S1` with their values in `m`.
         4. If `check_compatibility(S2.params[i], S1.params[i])` (note the direction of the check: see the subtyping rule for `FuncType`) is incompatible for any `i` or if `check_compatibility(S1.ret, S2.ret)` is incompatible, then they are incompatible. Otherwise, if `check_compatibility(S2.params[i], S1.params[i])` is possibly compatible for any `i` or if `check_compatibility(S1.ret, S2.ret)` is possibly compatible, consider `S1` and `S2` possibly compatible. Consider `S1` and `S2` compatible only if all checks are compatible.
+
+**Inferring Function Purity Locally**
+
+If the purity is not indicated with the `is_pure` field of the `Function` node, Relax attempts to infer the purity by checking the function body. We denote this local inference process as `infer_local_purity(f)` for a function `f`, applying the following rules:
+
+1. If `f` has the `relax.force_pure` attribute mapped to `True`, do not perform further checking and return `True`.
+2. Check every `Call` node in the body of `f`, other than recursive calls to `f` or those that occur inside functions nested within `f`:
+   1. If there is any `Call` node whose callee (`op` field) has `FuncStructInfo` with a defined `purity` and the defined `purity` is `False` or is an `Op` node whose `FPurity` attribute is `False`, then return `False`.
+   2. If there are no `Call` nodes whose callee has `FuncStructInfo` with `purity` set to `False` or is an `Op` node with `FPurity` set to `False`, but at least one `Call` node has a callee with `FuncStructInfo` that has undefined `purity`, then return undefined.
+   3. If the callees for all `Call` nodes have `FuncStructInfo` with `purity` set to `True` or are `Op` nodes with `FPurity` set to `True`, then return `True`.
 
 ### Derivation Rules
 
 Let `Γ` be the `StructInfo` context for Relax variables and let `Σ` track which shape variables are in scope.
 
-1. «Prepopulate `Γ` with the annotated types of all global functions (see the rule for `Function` nodes) that are called mutually recursively. Afterwards check the structural information of the global functions one at a time and populate the entry of `Γ` corresponding to that `GlobalVar`.»
+1. Prepopulate `Γ` with the annotated types of all global Relax functions (see the first two steps of the rule for `Function` nodes, below) and TIR `PrimFunc`s (see the rule for `PrimFunc`s below). Afterwards, check the structural information of the global functions one at a time and populate the entry of `Γ` corresponding to that `GlobalVar` with the inferred `StructInfo`, potentially overwriting the prepopulated one. «For soundness, all functions that call a global function whose `StructInfo` is overwritten must be rechecked, along with all callers of those functions (to fixpoint).»
 2. For a variable (`Var`, `DataflowVar`, or `GlobalVar`) `v`, look up `Γ[v]` for the structural information.
 3. For `Constant(value)`, the resulting structural information is `TensorStructInfo(ndim, dtype, shape, vdevice=undefined)` where `ndim` is the concrete rank of `value`, `dtype` is the concrete datatype used in `value`, and `shape` is a `ShapeExpr` giving the concrete shape of `value`. For example, for `Constant(1)`, `shape` is `ShapeExpr([])` and for `Constant([1, 2])`, `shape` is `ShapeExpr([IntImm(2, "int64")])`.
 4. For `PrimValue(prim_expr)`, the resulting `StructInfo` is `PrimStructInfo(dt)`, where `dt` is the datatype of `prim_expr`, derived according to the type-checking rules for TIR.
@@ -776,7 +797,7 @@ Let `Γ` be the `StructInfo` context for Relax variables and let `Σ` track whic
     2. Raise an error if `St` is not `TupleStructInfo`. 
     3. If `St` is `TupleStructInfo(fields)`, then raise an error if `fields` value has less than `i + 1` members.
     4. Use `fields[i]` (zero-based) as the structural information for the `TupleGetItem`.
-13. For an `ExternFunc` node, the resulting structural information is `FuncStructInfo(params=None, ret=ObjectStructInfo(), derive_func=default_derive)`.
+13. For an `ExternFunc` node, the resulting structural information is `FuncStructInfo(params=None, ret=ObjectStructInfo(), purity=False, derive_func=default_derive)`.
 14. For `Call(op, [arg1, arg2, ..., argn], type_args=[aT1, aT2, ..., aTn])`:
     1. For a call to an `Op`:
        1. We use the manually defined `FInferStructInfo` macro if it has been defined for `op` and `ObjectStructInfo()` as the resulting `StructInfo` if it has not. `FInferStructInfo` is a function that takes in the call node and returns the structural information of the result.
@@ -785,27 +806,40 @@ Let `Γ` be the `StructInfo` context for Relax variables and let `Σ` track whic
         1. Give an error if `Sf` is not `FuncStructInfo`.
         2. If the `derive_func` field of `Sf` is defined:
             1. If the current function has `is_pure` set to `True` and the current function does not have `relax.force_pure` mapped to `True` in its `attrs` field _or_ if the current scope is inside a `DataflowBlock`, then give a type error: External functions are assumed to be impure by default (the `call_pure_packed` operator can be used to indicate to the compiler that an external function is, in fact, pure).
-            2. Apply the `derive_func` macro to the call node to derive the structural information for the call node, ignoring the `ret` field of `Sf`. Additionally, 
+            2. Apply the `derive_func` macro to the call node to derive the structural information for the call node, ignoring the `ret` field of `Sf`. 
         3. If the current function has `is_pure` set to `True` and the current function does not have `relax.force_pure` mapped to `True` in its `attrs` field _or_ if the current scope is inside a `DataflowBlock`, then consider it a type error if `Sf`'s `purity` field is not `True`.
         4. Otherwise, `params` must be defined. Give an error if the length of `params` does not match the number of call arguments. Let the members of params be `P1`, `P2`, ..., `Pn`.
         5. Next, attempt to perform [beta-reduction](https://en.wikipedia.org/wiki/Lambda_calculus#%CE%B2-reduction) by matching unbound shape variables in `params` with the `Si`. Namely, get a shape var mapping `m` by applying `get_shape_var_mapping(params[i], Si)` for all `i` and taking the union of all resulting mappings. For each shape variable `v` that occurs in `Sf`, replace it with `m[v]` if `v` is in `m`.
         6. After the substitutions, give an error if `Pi <: Si` does not hold for some `i` (give a warning if it _possibly_ holds).
         7. Use `erase_to_well_defined(Sf.ret, Γ, Σ)` as the resulting structural information.
-15. For `Function(params=[v1, v2, ..., vn], body, ret_struct_info, is_pure, attrs)`:
+15. For a function `f` defined as `Function(params=[v1, v2, ..., vn], body, ret_struct_info, is_pure, attrs)`:
     1. Let `S1`, `S2`, ..., `Sn` be the structural information of the parameters. If `vi` has a structural annotation, then use that annotation for `Si`; if not, use `ObjectStructInfo()`. Let `Sr` be `ret_struct_info` if it is defined and `ObjectStructInfo()` if not.
     2. If the function is bound to a `GlobalVar` `gv`, set `Γ[gv]` to `FuncStructInfo(params=[S1, S2, ..., Sn], ret=Sr, purity=is_pure)`. Still check the structural information in `body` per the below steps, however.
     3. For each of the `vi`, set `Γ[vi]` to `Si`. Additionally, add all new shape variables introduced in the `Si` to `Σ`.
     4. Derive the structural information for `body`, calling it `Sb`.
     5. Give an error if `Sb` is incompatible with `Sr` via `check_compatibility` (warn if only possibly compatible).
-    6. If `ret_struct_info` is defined, use `FuncStructInfo(params=[S1, S2, ..., Sn], ret_struct_info, purity=is_pure)` as the structural information for the function. If `ret_struct_info` is not defined, use `FuncStructInfo(params=[S1, S2, ..., Sn], erase_to_well_defined(Sb, Γ, Σ), purity=is_pure)`.
-    7. Remove all variables added to `Γ` and `Σ` during the above steps of the derivation.
+    6. Let `p'` be the inferred purity of the function, using the `infer_local_purity(f)` procedure. If `is_pure` is defined and `p'` is defined and their values are not equal, then there is a type-checking error. We will define a value `p` to denote the checked purity of the function. If `is_pure` is not defined, then let `p` be `p'`. If `is_pure` and `p'` have the same value, let `p` have that value.
+    7. If `ret_struct_info` is defined, use `FuncStructInfo(params=[S1, S2, ..., Sn], ret_struct_info, purity=is_pure)` as the structural information for the function. If `ret_struct_info` is not defined, use `FuncStructInfo(params=[S1, S2, ..., Sn], erase_to_well_defined(Sb, Γ, Σ), purity=p)`.
+    8. Remove all variables added to `Γ` and `Σ` during the above steps of the derivation.
 16. For `PrimFunc(params, body, ret_type, buffer_map, attrs)` at the module level, which is bound to a `GlobalVar`:
     1. Suppose there are `n` members of `params`. For the `i`th member of `params` (let us call it `v`), let `si` be a corresponding `StructInfo` defined as follows:
         1. If `v` is in `buffer_map`, then let `b` be `buffer_map[v]`. Then, `si` is `TensorStructInfo(dtype=d, shape=ShapeExpr(s), ndim=len(s), vdevice=undefined)`, where `d` is the `dtype` field of `b`, `s` is the `shape` field of `b`.
         2. If `v` is not in `buffer_map` and it has a `Handle` type in TIR, then `si` is `ObjectStructInfo()`.
         3. Otherwise, `si` is `PrimStructInfo(d)`, where `d` is the `dtype` field of `v`.
     2. Let `pf` denote the `PrimFunc` and `p` be the purity derived from `IsPureFunction(pf)`. The `StructInfo` for the `PrimFunc` (namely, for the `GlobalVar` to which the `PrimFunc` is bound) is `FuncStructInfo([s0, s1, ..., sn-1], TupleStructInfo([]), purity=p)`. (Most `PrimFunc`s work by mutating their arguments; in order to call a `PrimFunc` from within a `DataflowBlock`, use `call_tir`, which allocates fresh tensors for the outputs.)
-    
+
+
+### Inferring Function Purity Globally
+
+Recursion or mutual recursion can result in situations where `infer_local_purity` cannot draw a conclusion about the purity of a given global function if the `is_pure` field has not been explicitly annotated. After `StructInfo` inference, the purity of all remaining global functions with `FuncStructInfo` whose `purity` field is undefined can be inferred by the following fixpoint algorithm:
+
+1. Search for a cycle of mutually recursive functions where at least one has unknown `purity`. If one is found and any function in the cycle has `FuncStructInfo` with a defined `purity` of `False`, then set the `purity` of all functions in that cycle to `False`. Re-run `StructInfo` inference on all callers of those functions to ensure consistency. Repeat this step until fixpoint (no more `StructInfo` is updated).
+2. Search for a cycle of mutually recursive functions where at least one has unknown `purity`. If one is found, then set the `purity` of all functions in that cycle to `True`. Re-run `StructInfo` inference on all callers of those functions to ensure consistency. Repeat this step until fixpoint (no more `StructInfo` is updated). (If these cycles were not covered in the first step, then no function in the cycle contains an impure operation; hence, it is safe to assume that they are pure except in the sense of possibly being an infinite loop.)
+3. If there are any (single) recursive functions with unknown purity, set the `purity` of each such function to `True` and re-run `StructInfo` inference on all callers of those functions to ensure consistency.
+
+The only functions whose purity could be inferred to be unknown must be recursive functions, mutually recursive functions (e.g, `f(x) = g(x)`, `g(x) = h(x)`, and `h(x) = f(x)`), or callers of those functions. Hence, it suffices to detect recursive and mutually recursive functions and update them and their callers.
+
+As a matter of implementation (in order to avoid having to run a fixpoint algorithm every time `StructInfo` inference must be done), the calling of this inference pass may be deferred so long as no global functions with unknown purity or calls to closures with unknown purity remain before lowering Relax to another representation. Hence, in practice, calls to functions with unknown purity may persist during intermediate stages of compilation.
 
 ### Propagating Virtual Device Information
 
